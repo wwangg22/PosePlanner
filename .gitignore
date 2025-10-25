@@ -1,3 +1,9 @@
 runs/
 
 assets/
+
+__pycache__/
+
+wandb/
+
+recorded_frames/

@@ -76,14 +76,19 @@ def safe_save(state, filename):
     return safe_filesystem_op(torch.save, state, filename)
 
 def safe_load(filename):
-    with torch.serialization.safe_globals({
-        "numpy.core.multiarray.scalar": np.core.multiarray.scalar,
-        "numpy.dtype": np.dtype,
-        "numpy.dtypes.Float32DType": lambda: np.dtype("float32")
-    }):
-        # Disable weights_only to avoid the unpickler bug
-        checkpoint = torch.load(filename, weights_only=False)
-    return checkpoint
+    # with torch.serialization.safe_globals({
+    #     "numpy.core.multiarray.scalar": np.core.multiarray.scalar,
+    #     "numpy.dtype": np.dtype,
+    #     "numpy.dtypes.Float32DType": lambda: np.dtype("float32")
+    # }):
+    #     # Disable weights_only to avoid the unpickler bug
+    #     checkpoint = torch.load(filename, weights_only=False)
+    # return checkpoint
+    torch.serialization.add_safe_globals({"numpy.core.multiarray.scalar": np.core.multiarray.scalar, "numpy.dtype": np.dtype, "numpy.dtypes.Float32DType": lambda: np.dtype("float32")})
+    ckpt = torch.load(filename, map_location="cpu", weights_only=False)
+    try: torch.serialization.remove_safe_globals({"numpy.core.multiarray.scalar": np.core.multiarray.scalar, "numpy.dtype": np.dtype, "numpy.dtypes.Float32DType": lambda: np.dtype("float32")})
+    except Exception: pass
+    return ckpt
 
 def save_checkpoint(filename, state):
     print("=> saving checkpoint '{}'".format(filename + '.pth'))

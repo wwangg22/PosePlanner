@@ -108,6 +108,8 @@ def get_rlgames_env_creator(
         else:
             _sim_device = sim_device
             _rl_device = rl_device
+        
+        print("task name is:", task_name)
 
         # create native task and pass custom config
         env = isaacgym_task_map[task_name](

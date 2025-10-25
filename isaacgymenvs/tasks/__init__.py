@@ -44,6 +44,7 @@ from .ingenuity import Ingenuity
 from .quadcopter import Quadcopter
 from .shadow_hand import ShadowHand
 from .allegro_hand import AllegroHand
+from .allegro_hand_pose_planner import AllegroHandPosePlanner
 from .dextreme.allegro_hand_dextreme import AllegroHandDextremeManualDR, AllegroHandDextremeADR
 from .trifinger import Trifinger
 
@@ -87,6 +88,7 @@ def resolve_allegro_kuka_two_arms(cfg, *args, **kwargs):
 # Mappings from strings to environments
 isaacgym_task_map = {
     "AllegroHand": AllegroHand,
+    "AllegroHandPosePlanner": AllegroHandPosePlanner,
     "AllegroKuka": resolve_allegro_kuka,
     "AllegroKukaTwoArms": resolve_allegro_kuka_two_arms,
     "AllegroHandManualDR": AllegroHandDextremeManualDR,
