@@ -545,7 +545,9 @@ class AllegroHandPosePlanner(VecTask):
         self.goal_object_indices = to_torch(self.goal_object_indices, dtype=torch.long, device=self.device)
 
     def compute_reward(self, actions):
-        joints = unscale(self.shadow_hand_dof_pos, self.shadow_hand_dof_lower_limits, self.shadow_hand_dof_upper_limits)
+        joints = self.shadow_hand_dof_pos
+        # print("Cur joints : ", joints[0])
+        # print("target joints : ", self.goal_joints[0])
         self.rew_buf[:], self.reset_buf[:], self.reset_goal_buf[:], self.progress_buf[:], self.successes[:], self.consecutive_successes[:] = compute_hand_reward(
             self.rew_buf, self.reset_buf, self.reset_goal_buf, self.progress_buf, self.successes, self.consecutive_successes,
             self.max_episode_length, self.object_pos, self.object_rot, joints, self.goal_pos, self.goal_rot, self.goal_joints,
@@ -772,6 +774,7 @@ class AllegroHandPosePlanner(VecTask):
                 size=(len(env_ids),), 
                 device=self.device
             )
+        # rand_indices = torch.zeros(len(env_ids), dtype=torch.long, device=self.device)
 
         new_rot = randomize_rotation(rand_floats[:, 0], rand_floats[:, 1], self.x_unit_tensor[env_ids], self.y_unit_tensor[env_ids])
 
@@ -800,6 +803,7 @@ class AllegroHandPosePlanner(VecTask):
                 size=(len(env_ids),), 
                 device=self.device
             )
+        # rand_indices = torch.zeros(len(env_ids), dtype=torch.long, device=self.device)
         # randomize start object poses
         self.reset_target_pose(env_ids)
 
@@ -843,8 +847,9 @@ class AllegroHandPosePlanner(VecTask):
         # pos = self.shadow_hand_default_dof_pos + self.reset_dof_pos_noise * rand_delta
         pos = self.poses[rand_indices, 7:].clone()
         self.shadow_hand_dof_pos[env_ids, :] = pos
-        self.shadow_hand_dof_vel[env_ids, :] = self.shadow_hand_dof_default_vel + \
-            self.reset_dof_vel_noise * rand_floats[:, 5+self.num_shadow_hand_dofs:5+self.num_shadow_hand_dofs*2]
+        self.shadow_hand_dof_vel[env_ids, :] = self.shadow_hand_dof_default_vel 
+        # + \
+        #     self.reset_dof_vel_noise * rand_floats[:, 5+self.num_shadow_hand_dofs:5+self.num_shadow_hand_dofs*2]
         self.prev_targets[env_ids, :self.num_shadow_hand_dofs] = pos
         self.cur_targets[env_ids, :self.num_shadow_hand_dofs] = pos
 
@@ -865,6 +870,7 @@ class AllegroHandPosePlanner(VecTask):
         # print("first env actions: ", actions[0])
         env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         goal_env_ids = self.reset_goal_buf.nonzero(as_tuple=False).squeeze(-1)
+        # print("goal env hits reset: ", goal_env_ids)
 
         # if only goals need reset, then call set API
         if len(goal_env_ids) > 0 and len(env_ids) == 0:
@@ -971,24 +977,26 @@ def compute_hand_reward(
     rot_dist = 2.0 * torch.asin(torch.clamp(torch.norm(quat_diff[:, 0:3], p=2, dim=-1), max=1.0))
 
     joint_dist = torch.norm(hand_joints - target_joints, p=2, dim=-1)
-    joint_rew = joint_dist * -0.03
-    # print("joint_dist [0]", joint_dist[0])
+    joint_rew = joint_dist * -0.4
+    print("joint_dist [0]", joint_dist[0])
 
-    dist_rew = goal_dist * dist_reward_scale
-    rot_rew = 1.0/(torch.abs(rot_dist) + rot_eps) * rot_reward_scale
+    dist_rew = goal_dist * dist_reward_scale * 1.2
+    rot_rew = 1.0/(torch.abs(rot_dist) + rot_eps) * rot_reward_scale * 0.5
 
     action_penalty = torch.sum(actions ** 2, dim=-1)
     # print("goal_dist [0] ", goal_dist[0])
-    # print("rot_rew [0] ", rot_rew[0])
+    # print("rot_rew [0] ", rot_dist[0])
 
     # Total reward is: position distance + orientation alignment + action regularization + success bonus + fall penalty
     reward = dist_rew + rot_rew + action_penalty * action_penalty_scale + joint_rew
 
     # Find out which envs hit the goal and update successes count
-    joint_ok = (joint_dist <= success_tolerance*10)
-    dist_ok  = (goal_dist  <= success_tolerance * 0.15)
-    rot_ok   = (torch.abs(rot_dist) <= success_tolerance)
-    goal_resets = torch.where((joint_ok + dist_ok + rot_ok) >= 3, torch.ones_like(reset_goal_buf), reset_goal_buf)
+    joint_ok = (joint_dist <= success_tolerance*3)
+    dist_ok  = (goal_dist  <= success_tolerance * 0.2)
+    rot_ok   = (torch.abs(rot_dist) <= success_tolerance*1)
+    ok_sum = joint_ok.int() + dist_ok.int() + rot_ok.int()
+    hit_goal = ok_sum >= 2
+    goal_resets = torch.where(hit_goal, torch.ones_like(reset_goal_buf), reset_goal_buf)
     # goal_resets = torch.where(torch.abs(rot_dist) <= success_tolerance, torch.ones_like(reset_goal_buf), reset_goal_buf)
     successes = successes + goal_resets
 
@@ -1002,7 +1010,8 @@ def compute_hand_reward(
     resets = torch.where(goal_dist >= fall_dist, torch.ones_like(reset_buf), reset_buf)
     if max_consecutive_successes > 0:
         # Reset progress buffer on goal envs if max_consecutive_successes > 0
-        progress_buf = torch.where(torch.abs(rot_dist) <= success_tolerance, torch.zeros_like(progress_buf), progress_buf)
+        # progress_buf = torch.where(torch.abs(rot_dist) <= success_tolerance, torch.zeros_like(progress_buf), progress_buf)
+        progress_buf = torch.where(hit_goal, torch.zeros_like(progress_buf), progress_buf)
         resets = torch.where(successes >= max_consecutive_successes, torch.ones_like(resets), resets)
 
     timed_out = progress_buf >= max_episode_length - 1

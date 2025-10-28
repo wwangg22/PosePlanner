@@ -1,6 +1,6 @@
 GPUS=$1
 len=${#array[@]}
-CKPT=/home/william/Desktop/USC/PosePlanner/runs/Allegro_6D_Z_24-16-57-16/nn/Allegro_6D_Z.pth
+CKPT=/home/william/Desktop/USC/PosePlanner/runs/Allegro_pose_planner_27-18-18-50/nn/Allegro_pose_planner.pth
 EXTRA_ARGS=${array[@]:1:$len}
 EXTRA_ARGS_SLUG=${EXTRA_ARGS// /_}
 
@@ -9,5 +9,5 @@ python ./isaacgymenvs/train.py \
 task=AllegroHandPosePlanner \
 checkpoint=${CKPT} \
 wandb_activate=True headless=True \
-wandb_name=Allegro_w_translation wandb_project=PosePlanner experiment=Allegro_w_translation \
+wandb_name=Allegro_pose_planner_joint wandb_project=PosePlanner experiment=Allegro_pose_planner_joint \
 ${EXTRA_ARGS}
