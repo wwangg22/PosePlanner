@@ -394,6 +394,7 @@ class AllegroHandPosePlanner(VecTask):
         p_h = torch.tensor([shadow_hand_start_pose.p.x,
                             shadow_hand_start_pose.p.y,
                             shadow_hand_start_pose.p.z], device=self.device, dtype=torch.float32)      # (3,)
+        self.hand_offset = p_h.unsqueeze(0)
         q_h = torch.tensor([shadow_hand_start_pose.r.x,
                             shadow_hand_start_pose.r.y,
                             shadow_hand_start_pose.r.z,
@@ -428,7 +429,18 @@ class AllegroHandPosePlanner(VecTask):
                 else:
                     raise ValueError(f"Pose entry missing dof '{name}'")
         # print(f"printing first pose to test: {self.poses[0]}")
-        
+        # ans = self.poses[:, 0:3] - self.hand_offset
+        # obj_positions = ans.cpu().numpy()
+        # mean_pos = obj_positions.mean(dim=0)
+        # std_pos = obj_positions.std(dim=0)
+        # min_pos, _ = obj_positions.min(dim=0)
+        # max_pos, _ = obj_positions.max(dim=0)
+
+        # print(f"\nObject location stats:")
+        # print(f"  mean: {mean_pos.tolist()}")
+        # print(f"  std:  {std_pos.tolist()}")
+        # print(f"  range: min={min_pos.tolist()}, max={max_pos.tolist()}")
+
 
         self.goal_joints = torch.zeros((self.num_envs, self.num_shadow_hand_dofs), dtype=torch.float, device=self.device)
 
@@ -543,6 +555,8 @@ class AllegroHandPosePlanner(VecTask):
         self.hand_indices = to_torch(self.hand_indices, dtype=torch.long, device=self.device)
         self.object_indices = to_torch(self.object_indices, dtype=torch.long, device=self.device)
         self.goal_object_indices = to_torch(self.goal_object_indices, dtype=torch.long, device=self.device)
+
+        self.cur_indices = torch.ones((self.num_envs,), dtype=torch.long, device=self.device)
 
     def compute_reward(self, actions):
         joints = self.shadow_hand_dof_pos
@@ -674,15 +688,17 @@ class AllegroHandPosePlanner(VecTask):
             goal_obs_start = obj_obs_start + 15  # 63
             goal_quat = self.goal_pose[:, 3:7]
             goal_quat_6d = self.quat_to_6d(goal_quat)
-            new_goal_pose = torch.cat([self.goal_pose[:, 0:3], goal_quat_6d], dim=-1)
+            normalize_goal_pose = self.goal_pose[:, 0:3] - self.hand_offset
+            new_goal_pose = torch.cat([normalize_goal_pose, goal_quat_6d], dim=-1)
             self.states_buf[:, goal_obs_start:goal_obs_start + 9] = new_goal_pose
             goal_quat_diff = quat_mul(self.object_rot, quat_conjugate(self.goal_rot))
             goal_diff_6d = self.quat_to_6d(goal_quat_diff)
             self.states_buf[:, goal_obs_start + 9:goal_obs_start + 15] = goal_diff_6d
 
             goal_joints_start = goal_obs_start + 15  # 78
-            self.states_buf[:, goal_joints_start:goal_joints_start + self.num_shadow_hand_dofs] = self.goal_joints[:, :]
-
+            self.states_buf[:, goal_joints_start:goal_joints_start + self.num_shadow_hand_dofs] = unscale(self.goal_joints[:, :], self.shadow_hand_dof_lower_limits, self.shadow_hand_dof_upper_limits) 
+            # print("goal joints first env: ", self.states_buf[0, goal_joints_start:goal_joints_start + self.num_shadow_hand_dofs])
+            # print("current joints first env: ", self.states_buf[0, 0:self.num_shadow_hand_dofs])
             fingertip_obs_start = goal_joints_start + 16  # 94
 
             # obs_end = 96 + 65 + 30 = 191
@@ -706,14 +722,15 @@ class AllegroHandPosePlanner(VecTask):
             goal_obs_start = obj_obs_start + 15  # 63
             goal_quat = self.goal_pose[:, 3:7]
             goal_quat_6d = self.quat_to_6d(goal_quat)
-            new_goal_pose = torch.cat([self.goal_pose[:, 0:3], goal_quat_6d], dim=-1)
+            normalize_goal_pose = self.goal_pose[:, 0:3] - self.hand_offset
+            new_goal_pose = torch.cat([normalize_goal_pose, goal_quat_6d], dim=-1)
             self.obs_buf[:, goal_obs_start:goal_obs_start + 9] = new_goal_pose
             goal_quat_diff = quat_mul(self.object_rot, quat_conjugate(self.goal_rot))
             goal_diff_6d = self.quat_to_6d(goal_quat_diff)
             self.obs_buf[:, goal_obs_start + 9:goal_obs_start + 15] = goal_diff_6d
 
             goal_joints_start = goal_obs_start + 15  # 78
-            self.obs_buf[:, goal_joints_start:goal_joints_start + self.num_shadow_hand_dofs] = self.goal_joints[:, :]
+            self.obs_buf[:, goal_joints_start:goal_joints_start + self.num_shadow_hand_dofs] = unscale(self.goal_joints[:, :], self.shadow_hand_dof_lower_limits, self.shadow_hand_dof_upper_limits)
 
             fingertip_obs_start = goal_joints_start + 16  # 94
 
@@ -768,12 +785,14 @@ class AllegroHandPosePlanner(VecTask):
 
     def reset_target_pose(self, env_ids, apply_reset=False):
         rand_floats = torch_rand_float(-1.0, 1.0, (len(env_ids), 4), device=self.device)
-        rand_indices = torch.randint(
-                low=0, 
-                high=len(self.poses), 
-                size=(len(env_ids),), 
-                device=self.device
-            )
+        # rand_indices = torch.randint(
+        #         low=0, 
+        #         high=len(self.poses), 
+        #         size=(len(env_ids),), 
+        #         device=self.device
+        #     )
+        self.cur_indices[env_ids] = (self.cur_indices[env_ids] + 1) % len(self.poses)
+        rand_indices = self.cur_indices[env_ids]
         # rand_indices = torch.zeros(len(env_ids), dtype=torch.long, device=self.device)
 
         new_rot = randomize_rotation(rand_floats[:, 0], rand_floats[:, 1], self.x_unit_tensor[env_ids], self.y_unit_tensor[env_ids])
@@ -797,12 +816,14 @@ class AllegroHandPosePlanner(VecTask):
     def reset_idx(self, env_ids, goal_env_ids):
         # generate random values
         rand_floats = torch_rand_float(-1.0, 1.0, (len(env_ids), self.num_shadow_hand_dofs * 2 + 5), device=self.device)
-        rand_indices = torch.randint(
-                low=0, 
-                high=len(self.poses), 
-                size=(len(env_ids),), 
-                device=self.device
-            )
+        # rand_indices = torch.randint(
+        #         low=0, 
+        #         high=len(self.poses), 
+        #         size=(len(env_ids),), 
+        #         device=self.device
+        #     )
+        # initialize to previous pose index, if its 0 set to last index
+        rand_indices = (self.cur_indices[env_ids] - 1) % len(self.poses)
         # rand_indices = torch.zeros(len(env_ids), dtype=torch.long, device=self.device)
         # randomize start object poses
         self.reset_target_pose(env_ids)
@@ -975,25 +996,29 @@ def compute_hand_reward(
     # Orientation alignment for the cube in hand and goal cube
     quat_diff = quat_mul(object_rot, quat_conjugate(target_rot))
     rot_dist = 2.0 * torch.asin(torch.clamp(torch.norm(quat_diff[:, 0:3], p=2, dim=-1), max=1.0))
-
+    
     joint_dist = torch.norm(hand_joints - target_joints, p=2, dim=-1)
-    joint_rew = joint_dist * -0.4
-    print("joint_dist [0]", joint_dist[0])
+    # joint_rew = joint_dist * -0.6
+    # print("joint_dist [0]", joint_dist[0])
 
     dist_rew = goal_dist * dist_reward_scale * 1.2
-    rot_rew = 1.0/(torch.abs(rot_dist) + rot_eps) * rot_reward_scale * 0.5
+    rot_rew = 1.0/(torch.abs(rot_dist) + rot_eps) * rot_reward_scale * 0.4
 
     action_penalty = torch.sum(actions ** 2, dim=-1)
-    # print("goal_dist [0] ", goal_dist[0])
-    # print("rot_rew [0] ", rot_dist[0])
+    # print("goal_dist [0] ", dist_rew[0])
+    # print("rot_rew [0] ", rot_rew[0])
 
     # Total reward is: position distance + orientation alignment + action regularization + success bonus + fall penalty
-    reward = dist_rew + rot_rew + action_penalty * action_penalty_scale + joint_rew
+    reward = dist_rew + rot_rew + action_penalty * action_penalty_scale 
 
     # Find out which envs hit the goal and update successes count
     joint_ok = (joint_dist <= success_tolerance*3)
-    dist_ok  = (goal_dist  <= success_tolerance * 0.2)
+    dist_ok  = (goal_dist  <= success_tolerance * 0.15)
     rot_ok   = (torch.abs(rot_dist) <= success_tolerance*1)
+
+    mask = dist_ok & rot_ok
+    # joint_rew = torch.where(mask, joint_dist * -1.0, torch.zeros_like(joint_dist))
+    # reward = reward + joint_rew
     ok_sum = joint_ok.int() + dist_ok.int() + rot_ok.int()
     hit_goal = ok_sum >= 2
     goal_resets = torch.where(hit_goal, torch.ones_like(reset_goal_buf), reset_goal_buf)
