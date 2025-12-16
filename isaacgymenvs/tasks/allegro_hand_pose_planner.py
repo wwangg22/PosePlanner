@@ -34,7 +34,7 @@ import torch.nn.functional as F
 from isaacgym import gymtorch
 from isaacgym import gymapi
 
-from isaacgymenvs.utils.torch_jit_utils import scale, unscale, quat_mul, quat_conjugate, quat_from_angle_axis, \
+from isaacgymenvs.utils.torch_jit_utils import scale, unscale, quat_apply, quat_mul, quat_conjugate, quat_from_angle_axis, \
     to_torch, get_axis_params, torch_rand_float, tensor_clamp  
 from isaacgymenvs.tasks.base.vec_task import VecTask
 
@@ -73,7 +73,6 @@ def _extract_object_in_palm(entry):
         # ori_np = np.array([qw0, qx0, qy0, qz0])  # (w,x,y,z)
         # t_oh, q_oh = object_in_hand_from_hand_in_object(loc_np, ori_np)
         # return t_oh, q_oh, qpos0
-
 
 class AllegroHandPosePlanner(VecTask):
 
@@ -243,6 +242,7 @@ class AllegroHandPosePlanner(VecTask):
 
         self.rb_forces = torch.zeros((self.num_envs, self.num_bodies, 3), dtype=torch.float, device=self.device)
 
+
         
         # self.goal_dx = [-0.03, 0.01]
         # self.goal_dy = [-0.015, 0.015]
@@ -391,10 +391,12 @@ class AllegroHandPosePlanner(VecTask):
             return v + w[...,None]*t + torch.cross(qv, t, dim=-1)
 
         # ---- Compose hand (world) with object (hand frame) ----
-        p_h = torch.tensor([shadow_hand_start_pose.p.x,
+        self.p_h = torch.tensor([shadow_hand_start_pose.p.x,
                             shadow_hand_start_pose.p.y,
                             shadow_hand_start_pose.p.z], device=self.device, dtype=torch.float32)      # (3,)
-        self.hand_offset = p_h.unsqueeze(0)
+        self.hand_offset = self.p_h.unsqueeze(0)
+        self.hand_start = self.p_h
+        self.hand_start[2] += 0.08
         q_h = torch.tensor([shadow_hand_start_pose.r.x,
                             shadow_hand_start_pose.r.y,
                             shadow_hand_start_pose.r.z,
@@ -421,8 +423,8 @@ class AllegroHandPosePlanner(VecTask):
             obj_loc, obj_ori, qpos0 = _extract_object_in_palm(entry)
             obj_loc = torch.tensor(obj_loc, dtype=torch.float, device=self.device)
             obj_ori = torch.tensor(obj_ori, dtype=torch.float, device=self.device)
-            self.poses[i, 0:3] = p_h + qrot_xyzw(q_h, obj_loc)
-            self.poses[i, 3:7] = qmul_xyzw(qnorm_xyzw(obj_ori), qnorm_xyzw(q_h))
+            self.poses[i, 0:3] = obj_loc
+            self.poses[i, 3:7] = qnorm_xyzw(obj_ori)
             for name, dof_idx in self.hand_dof_map.items():
                 if name in qpos0:
                     self.poses[i, 7 + dof_idx] = float(qpos0[name])
@@ -467,7 +469,7 @@ class AllegroHandPosePlanner(VecTask):
         if self.object_type == "pen":
             object_start_pose.p.z = shadow_hand_start_pose.p.z + 0.02
 
-        self.goal_displacement = gymapi.Vec3(-0.0, -0.065, 0.1)
+        self.goal_displacement = gymapi.Vec3(-0.02, -0.075, 0.1)
         self.goal_displacement_tensor = to_torch(
             [self.goal_displacement.x, self.goal_displacement.y, self.goal_displacement.z], device=self.device)
         goal_start_pose = gymapi.Transform()
@@ -495,6 +497,9 @@ class AllegroHandPosePlanner(VecTask):
         object_rb_count = self.gym.get_asset_rigid_body_count(object_asset)
         self.object_rb_handles = list(range(shadow_hand_rb_count, shadow_hand_rb_count + object_rb_count))
 
+        hand_env_pos_list = []
+        hand_env_quat_list = []
+
         for i in range(self.num_envs):
             # create env instance
             env_ptr = self.gym.create_env(
@@ -503,11 +508,53 @@ class AllegroHandPosePlanner(VecTask):
 
             if self.aggregate_mode >= 1:
                 self.gym.begin_aggregate(env_ptr, max_agg_bodies, max_agg_shapes, True)
+            
+            hand_pose_i = gymapi.Transform()
+            hand_pose_i.p = gymapi.Vec3(
+                shadow_hand_start_pose.p.x,
+                shadow_hand_start_pose.p.y,
+                shadow_hand_start_pose.p.z,
+            )
+
+            # sample random yaw/pitch/roll
+            # yaw   = np.random.uniform(-np.pi,  np.pi)      # around world z
+            # pitch = np.random.uniform(-np.pi/2, np.pi/2)   # around world y
+            # roll  = np.random.uniform(-np.pi,  np.pi)      # around world x
+            yaw = np.random.uniform(0.0, 0.0)
+            pitch = np.random.uniform(0.0, 0.0)
+            roll = np.random.uniform(0.0, 0.0)
+
+            q_yaw   = gymapi.Quat.from_axis_angle(gymapi.Vec3(0, 0, 1), yaw)
+            q_pitch = gymapi.Quat.from_axis_angle(gymapi.Vec3(0, 1, 0), pitch)
+            q_roll  = gymapi.Quat.from_axis_angle(gymapi.Vec3(1, 0, 0), roll)
+
+            # random rotation * base rotation (order: world -> yaw -> pitch -> roll -> base)
+            q_base = shadow_hand_start_pose.r
+            q_rand = q_yaw * q_pitch * q_roll
+            hand_pose_i.r = q_rand * q_base
+
+            hand_env_pos_list.append([
+                hand_pose_i.p.x,
+                hand_pose_i.p.y,
+                hand_pose_i.p.z,
+            ])
+            hand_env_quat_list.append([
+                hand_pose_i.r.x,
+                hand_pose_i.r.y,
+                hand_pose_i.r.z,
+                hand_pose_i.r.w,   # xyzw
+            ])
 
             # add hand - collision filter = -1 to use asset collision filters set in mjcf loader
-            allegro_hand_actor = self.gym.create_actor(env_ptr, allegro_hand_asset, shadow_hand_start_pose, "hand", i, -1, 0)
-            self.hand_start_states.append([shadow_hand_start_pose.p.x, shadow_hand_start_pose.p.y, shadow_hand_start_pose.p.z,
-                                           shadow_hand_start_pose.r.x, shadow_hand_start_pose.r.y, shadow_hand_start_pose.r.z, shadow_hand_start_pose.r.w,
+            # allegro_hand_actor = self.gym.create_actor(env_ptr, allegro_hand_asset, shadow_hand_start_pose, "hand", i, -1, 0)
+            # self.hand_start_states.append([shadow_hand_start_pose.p.x, shadow_hand_start_pose.p.y, shadow_hand_start_pose.p.z,
+            #                                shadow_hand_start_pose.r.x, shadow_hand_start_pose.r.y, shadow_hand_start_pose.r.z, shadow_hand_start_pose.r.w,
+            #                                0, 0, 0, 0, 0, 0])
+            allegro_hand_actor = self.gym.create_actor(
+                env_ptr, allegro_hand_asset, hand_pose_i, "hand", i, -1, 0
+            )
+            self.hand_start_states.append([hand_pose_i.p.x, hand_pose_i.p.y, hand_pose_i.p.z,
+                                           hand_pose_i.r.x, hand_pose_i.r.y, hand_pose_i.r.z, hand_pose_i.r.w,
                                            0, 0, 0, 0, 0, 0])
             self.gym.set_actor_dof_properties(env_ptr, allegro_hand_actor, shadow_hand_dof_props)
             hand_idx = self.gym.get_actor_index(env_ptr, allegro_hand_actor, gymapi.DOMAIN_SIM)
@@ -545,9 +592,11 @@ class AllegroHandPosePlanner(VecTask):
 
         self.object_init_state = to_torch(self.object_init_state, device=self.device, dtype=torch.float).view(self.num_envs, 13)
         self.goal_states = self.object_init_state.clone()
-        self.goal_states[:, self.up_axis_idx] += 0.04
+        # self.goal_states[:, self.up_axis_idx] += 0.04
         self.goal_init_state = self.goal_states.clone()
         self.hand_start_states = to_torch(self.hand_start_states, device=self.device).view(self.num_envs, 13)
+        self.hand_env_pos = to_torch(hand_env_pos_list, device=self.device, dtype=torch.float32).view(self.num_envs, 3)
+        self.hand_env_quat = to_torch(hand_env_quat_list, device=self.device, dtype=torch.float32).view(self.num_envs, 4)
 
         self.object_rb_handles = to_torch(self.object_rb_handles, dtype=torch.long, device=self.device)
         self.object_rb_masses = to_torch(self.object_rb_masses, dtype=torch.float, device=self.device)
@@ -671,6 +720,41 @@ class AllegroHandPosePlanner(VecTask):
             self.obs_buf[:, 56:72] = self.actions
 
     def compute_6d_state(self, asymm_obs = False):
+
+        hand_root = self.root_state_tensor[self.hand_indices, 0:7]  # [N, 7]
+        hand_pos  = hand_root[:, 0:3]                               # [N, 3]
+        hand_quat = hand_root[:, 3:7]                               # [N, 4] (w,x,y,z) from gym
+        hand_quat_conj = quat_conjugate(hand_quat)                  # inverse rotation
+        hand_rot_6d = self.quat_to_6d(hand_quat)                    # [N, 6] orientation of HAND
+
+        # ---------------------------------------------------------
+        # 2) Object pose in HAND frame (normalized)
+        # ---------------------------------------------------------
+        # positions: translate to hand, then rotate into hand frame
+        obj_pos_rel_world = self.object_pos - hand_pos              # [N, 3]
+        obj_pos_hand = quat_apply(hand_quat_conj, obj_pos_rel_world)  # [N, 3]
+
+        # orientations: R_hand^* * R_obj   (object orientation in hand frame)
+        obj_rot_hand = quat_mul(hand_quat_conj, self.object_rot)    # [N, 4]
+        quat_6d = self.quat_to_6d(obj_rot_hand)                  # [N, 6]
+
+        # ---------------------------------------------------------
+        # 3) Goal pose in HAND frame
+        # ---------------------------------------------------------
+        goal_pos_rel_world = self.goal_pos - hand_pos
+        normalize_goal_pose = quat_apply(hand_quat_conj, goal_pos_rel_world)  # [N, 3]
+
+        goal_rot_hand = quat_mul(hand_quat_conj, self.goal_rot)     # [N, 4]
+        goal_quat_6d = self.quat_to_6d(goal_rot_hand)                # [N, 6]
+
+        # Relative orientation (object -> goal) in HAND frame
+        goal_quat_diff = quat_mul(obj_rot_hand, quat_conjugate(goal_rot_hand))  # [N,4]
+        goal_diff_6d = self.quat_to_6d(goal_quat_diff)  
+        # print("goal diff 6d: ", goal_diff_6d[0])
+        # print("obj_rot_hand: ", obj_rot_hand[0])
+        # print("goal_rot_hand: ", goal_rot_hand[0])
+        # print("obj_pos_hand[0]: ", obj_pos_hand[0])
+        # print("goal pos hand[0]: ", normalize_goal_pose[0])
         if asymm_obs:
             self.states_buf[:, 0:self.num_shadow_hand_dofs] = unscale(self.shadow_hand_dof_pos,
                                                                       self.shadow_hand_dof_lower_limits, self.shadow_hand_dof_upper_limits)
@@ -678,25 +762,29 @@ class AllegroHandPosePlanner(VecTask):
             self.states_buf[:, 2*self.num_shadow_hand_dofs:3*self.num_shadow_hand_dofs] = self.force_torque_obs_scale * self.dof_force_tensor
 
             obj_obs_start = 3*self.num_shadow_hand_dofs  # 48
-            quat = self.object_pose[:, 3:7]
-            quat_6d = self.quat_to_6d(quat)
-            new_object_pose = torch.cat([self.object_pose[:, 0:3], quat_6d], dim=-1)
+            # quat = self.object_pose[:, 3:7]
+            # quat_6d = self.quat_to_6d(quat)
+            # new_object_pose = torch.cat([self.object_pose[:, 0:3], quat_6d], dim=-1)
+            new_object_pose = torch.cat([obj_pos_hand, quat_6d], dim=-1)
             self.states_buf[:, obj_obs_start:obj_obs_start + 9] = new_object_pose
             self.states_buf[:, obj_obs_start + 9:obj_obs_start + 12] = self.object_linvel
             self.states_buf[:, obj_obs_start + 12:obj_obs_start + 15] = self.vel_obs_scale * self.object_angvel
 
             goal_obs_start = obj_obs_start + 15  # 63
-            goal_quat = self.goal_pose[:, 3:7]
-            goal_quat_6d = self.quat_to_6d(goal_quat)
-            normalize_goal_pose = self.goal_pose[:, 0:3] - self.hand_offset
+            # goal_quat = self.goal_pose[:, 3:7]
+            # goal_quat_6d = self.quat_to_6d(goal_quat)
+            # normalize_goal_pose = self.goal_pose[:, 0:3] - self.hand_offset
             new_goal_pose = torch.cat([normalize_goal_pose, goal_quat_6d], dim=-1)
             self.states_buf[:, goal_obs_start:goal_obs_start + 9] = new_goal_pose
-            goal_quat_diff = quat_mul(self.object_rot, quat_conjugate(self.goal_rot))
-            goal_diff_6d = self.quat_to_6d(goal_quat_diff)
+            # goal_quat_diff = quat_mul(self.object_rot, quat_conjugate(self.goal_rot))
+            # goal_diff_6d = self.quat_to_6d(goal_quat_diff)
             self.states_buf[:, goal_obs_start + 9:goal_obs_start + 15] = goal_diff_6d
 
             goal_joints_start = goal_obs_start + 15  # 78
-            self.states_buf[:, goal_joints_start:goal_joints_start + self.num_shadow_hand_dofs] = unscale(self.goal_joints[:, :], self.shadow_hand_dof_lower_limits, self.shadow_hand_dof_upper_limits) 
+            # self.states_buf[:, goal_joints_start:goal_joints_start + self.num_shadow_hand_dofs] = unscale(self.goal_joints[:, :], self.shadow_hand_dof_lower_limits, self.shadow_hand_dof_upper_limits) 
+            self.states_buf[:, goal_joints_start:goal_joints_start + 6] = hand_rot_6d
+            self.states_buf[:, goal_joints_start + 6:goal_joints_start + 12] = hand_rot_6d
+            self.states_buf[:, goal_joints_start + 12:goal_joints_start + 16] = 0
             # print("goal joints first env: ", self.states_buf[0, goal_joints_start:goal_joints_start + self.num_shadow_hand_dofs])
             # print("current joints first env: ", self.states_buf[0, 0:self.num_shadow_hand_dofs])
             fingertip_obs_start = goal_joints_start + 16  # 94
@@ -712,26 +800,29 @@ class AllegroHandPosePlanner(VecTask):
             self.obs_buf[:, 2*self.num_shadow_hand_dofs:3*self.num_shadow_hand_dofs] = self.force_torque_obs_scale * self.dof_force_tensor
 
             obj_obs_start = 3*self.num_shadow_hand_dofs  # 48
-            quat = self.object_pose[:, 3:7]
-            quat_6d = self.quat_to_6d(quat)
-            new_object_pose = torch.cat([self.object_pose[:, 0:3], quat_6d], dim=-1)
+            # quat = self.object_pose[:, 3:7]
+            # quat_6d = self.quat_to_6d(quat)
+            # new_object_pose = torch.cat([self.object_pose[:, 0:3], quat_6d], dim=-1)
+            new_object_pose = torch.cat([obj_pos_hand, quat_6d], dim=-1)
             self.obs_buf[:, obj_obs_start:obj_obs_start + 9] = new_object_pose
             self.obs_buf[:, obj_obs_start + 9:obj_obs_start + 12] = self.object_linvel
             self.obs_buf[:, obj_obs_start + 12:obj_obs_start + 15] = self.vel_obs_scale * self.object_angvel
 
             goal_obs_start = obj_obs_start + 15  # 63
-            goal_quat = self.goal_pose[:, 3:7]
-            goal_quat_6d = self.quat_to_6d(goal_quat)
-            normalize_goal_pose = self.goal_pose[:, 0:3] - self.hand_offset
+            # goal_quat = self.goal_pose[:, 3:7]
+            # goal_quat_6d = self.quat_to_6d(goal_quat)
+            # normalize_goal_pose = self.goal_pose[:, 0:3] - self.hand_offset
             new_goal_pose = torch.cat([normalize_goal_pose, goal_quat_6d], dim=-1)
             self.obs_buf[:, goal_obs_start:goal_obs_start + 9] = new_goal_pose
-            goal_quat_diff = quat_mul(self.object_rot, quat_conjugate(self.goal_rot))
-            goal_diff_6d = self.quat_to_6d(goal_quat_diff)
+            # goal_quat_diff = quat_mul(self.object_rot, quat_conjugate(self.goal_rot))
+            # goal_diff_6d = self.quat_to_6d(goal_quat_diff)
             self.obs_buf[:, goal_obs_start + 9:goal_obs_start + 15] = goal_diff_6d
 
             goal_joints_start = goal_obs_start + 15  # 78
-            self.obs_buf[:, goal_joints_start:goal_joints_start + self.num_shadow_hand_dofs] = unscale(self.goal_joints[:, :], self.shadow_hand_dof_lower_limits, self.shadow_hand_dof_upper_limits)
-
+            # self.obs_buf[:, goal_joints_start:goal_joints_start + self.num_shadow_hand_dofs] = unscale(self.goal_joints[:, :], self.shadow_hand_dof_lower_limits, self.shadow_hand_dof_upper_limits)
+            self.obs_buf[:, goal_joints_start:goal_joints_start + 6] = hand_rot_6d
+            self.obs_buf[:, goal_joints_start + 6:goal_joints_start + 12] = hand_rot_6d
+            self.obs_buf[:, goal_joints_start + 12:goal_joints_start + 16] = 0
             fingertip_obs_start = goal_joints_start + 16  # 94
 
             # obs_end = 96 + 65 + 30 = 191
@@ -784,25 +875,54 @@ class AllegroHandPosePlanner(VecTask):
             self.obs_buf[:, obs_end:obs_end + self.num_actions] = self.actions
 
     def reset_target_pose(self, env_ids, apply_reset=False):
-        rand_floats = torch_rand_float(-1.0, 1.0, (len(env_ids), 4), device=self.device)
+        # rand_floats = torch_rand_float(-1.0, 1.0, (len(env_ids), 4), device=self.device)
         # rand_indices = torch.randint(
         #         low=0, 
         #         high=len(self.poses), 
         #         size=(len(env_ids),), 
         #         device=self.device
         #     )
-        self.cur_indices[env_ids] = (self.cur_indices[env_ids] + 1) % len(self.poses)
-        rand_indices = self.cur_indices[env_ids]
+        # self.cur_indices[env_ids] = (self.cur_indices[env_ids] + 1) % len(self.poses)
+        # rand_indices = self.cur_indices[env_ids]
         # rand_indices = torch.zeros(len(env_ids), dtype=torch.long, device=self.device)
+
+        # x = torch_rand_float(-0.01, 0.01, (env_ids.numel(), 1), device=self.device)
+        # y = torch_rand_float(-0.02, 0.02, (env_ids.numel(), 1), device=self.device)
+        # z = torch_rand_float(-0.01, 0.02, (env_ids.numel(), 1), device=self.device)
+        x = torch_rand_float(0.06, 0.09, (env_ids.numel(), 1), device=self.device)
+        y = torch_rand_float(-0.01, 0.01, (env_ids.numel(), 1), device=self.device)
+        z = torch_rand_float(-0.01, 0.01, (env_ids.numel(), 1), device=self.device)
+        rand_pos = torch.cat([x, y, z], dim=-1)
+
+        # sample random orientations using existing randomize_rotation
+        rand_floats = torch_rand_float(-1.0, 1.0, (env_ids.numel(), 2), device=self.device)
+        new_rot = randomize_rotation(
+            rand_floats[:, 0],
+            rand_floats[:, 1],
+            self.x_unit_tensor[env_ids],
+            self.y_unit_tensor[env_ids],
+        )
+
 
         new_rot = randomize_rotation(rand_floats[:, 0], rand_floats[:, 1], self.x_unit_tensor[env_ids], self.y_unit_tensor[env_ids])
 
-        self.goal_states[env_ids, 0:3] = self.poses[rand_indices, 0:3]
-        # self.goal_states[env_ids, 0] += self.goal_dx[0] + (self.goal_dx[1] - self.goal_dx[0]) * 0.5 * (rand_floats[:, 2] + 1)
-        # self.goal_states[env_ids, 1] += self.goal_dy[0] + (self.goal_dy[1] - self.goal_dy[0]) * 0.5 * (rand_floats[:, 3] + 1)
-        self.goal_states[env_ids, 3:7] = self.poses[rand_indices, 3:7]
-        self.goal_joints[env_ids, :] = self.poses[rand_indices, 7:7 + self.num_shadow_hand_dofs]
-        self.root_state_tensor[self.goal_object_indices[env_ids], 0:3] = self.goal_states[env_ids, 0:3] + self.goal_displacement_tensor
+        hand_pos = self.hand_env_pos[env_ids]    # [B, 3]
+        hand_quat = self.hand_env_quat[env_ids]  # [B, 4] xyzw
+
+        # Map LOCAL goal pose to WORLD
+        goal_pos_world = quat_apply(hand_quat, rand_pos) + hand_pos       # [B, 3]
+        goal_rot_world = quat_mul(hand_quat, new_rot)                    # [B, 4]
+
+        # Write into goal_states and root_state_tensor
+        self.goal_states[env_ids, 0:3] = goal_pos_world
+        self.goal_states[env_ids, 3:7] = goal_rot_world
+        self.goal_joints[env_ids, :] = 0.0
+        # self.goal_states[env_ids, 0:3] = rand_pos + self.hand_offset.unsqueeze(0)
+        # # self.goal_states[env_ids, 0] += self.goal_dx[0] + (self.goal_dx[1] - self.goal_dx[0]) * 0.5 * (rand_floats[:, 2] + 1)
+        # # self.goal_states[env_ids, 1] += self.goal_dy[0] + (self.goal_dy[1] - self.goal_dy[0]) * 0.5 * (rand_floats[:, 3] + 1)
+        # self.goal_states[env_ids, 3:7] = new_rot
+        # self.goal_joints[env_ids, :] = 0.0
+        self.root_state_tensor[self.goal_object_indices[env_ids], 0:3] = self.goal_states[env_ids, 0:3]
         self.root_state_tensor[self.goal_object_indices[env_ids], 3:7] = self.goal_states[env_ids, 3:7]
         self.root_state_tensor[self.goal_object_indices[env_ids], 7:13] = torch.zeros_like(self.root_state_tensor[self.goal_object_indices[env_ids], 7:13])
 
@@ -823,18 +943,58 @@ class AllegroHandPosePlanner(VecTask):
         #         device=self.device
         #     )
         # initialize to previous pose index, if its 0 set to last index
-        rand_indices = (self.cur_indices[env_ids] - 1) % len(self.poses)
+        # rand_indices = (self.cur_indices[env_ids] - 1) % len(self.poses)
         # rand_indices = torch.zeros(len(env_ids), dtype=torch.long, device=self.device)
         # randomize start object poses
         self.reset_target_pose(env_ids)
 
         # reset rigid body forces
         self.rb_forces[env_ids, :, :] = 0.0
+        
+        curr_indices = torch.randint(
+            low=0,
+            high=self.poses.shape[0],
+            size=(env_ids.numel(),),
+            device=self.device,
+        )
+
+        pose_batch = self.poses[curr_indices]             # [B, 23]
+        obj_pos_local = pose_batch[:, 0:3]                # [B, 3]
+        obj_rot_local = pose_batch[:, 3:7]                # [B, 4]
+        joint_targets = pose_batch[:, 7:7+self.num_shadow_hand_dofs]  # [B, num_dofs]
+
+        # Hand base transform (world <- palm)
+        hand_pos = self.hand_env_pos[env_ids]             # [B, 3]
+        hand_quat = self.hand_env_quat[env_ids]           # [B, 4]
+
+        # LOCAL -> WORLD for object
+        obj_pos_world = quat_apply(hand_quat, obj_pos_local) + hand_pos   # [B, 3]
+        obj_rot_world = quat_mul(hand_quat, obj_rot_local)
+        # x = torch_rand_float(0.0, 0.04, (env_ids.numel(), 1), device=self.device)
+        # y = torch_rand_float(-0.01, 0.01, (env_ids.numel(), 1), device=self.device)
+        # z = torch_rand_float(-0.01, 0.01, (env_ids.numel(), 1), device=self.device)
+        # rand_pos = torch.cat([x, y, z], dim=-1)
+        # # sample random orientations using existing randomize_rotation
+        # rand_floats = torch_rand_float(-1.0, 1.0, (env_ids.numel(), 2), device=self.device)
+        # new_rot = randomize_rotation(
+        #     rand_floats[:, 0],
+        #     rand_floats[:, 1],
+        #     self.x_unit_tensor[env_ids],
+        #     self.y_unit_tensor[env_ids],
+        # )
+
+        # hand_pos = self.hand_env_pos[env_ids]    # [B, 3]
+        # hand_quat = self.hand_env_quat[env_ids]  # [B, 4]
+
+        # # LOCAL -> WORLD for current object
+        # obj_pos_world = quat_apply(hand_quat, rand_pos) + hand_pos    # [B, 3]
+        # obj_rot_world = quat_mul(hand_quat, new_rot) 
 
         # reset object
         self.root_state_tensor[self.object_indices[env_ids]] = self.object_init_state[env_ids].clone()
-        self.root_state_tensor[self.object_indices[env_ids], 0:3] = self.poses[rand_indices, 0:3]
-        self.root_state_tensor[self.object_indices[env_ids], 3:7] = self.poses[rand_indices, 3:7]
+        self.root_state_tensor[self.object_indices[env_ids], 0:3] = obj_pos_world #rand_pos + self.hand_offset.unsqueeze(0)
+        
+        self.root_state_tensor[self.object_indices[env_ids], 3:7] = obj_rot_world #new_rot
         # self.root_state_tensor[self.object_indices[env_ids], 0:2] = self.object_init_state[env_ids, 0:2] + \
         #     self.reset_position_noise * rand_floats[:, 0:2]
         # self.root_state_tensor[self.object_indices[env_ids], self.up_axis_idx] = self.object_init_state[env_ids, self.up_axis_idx] + \
@@ -863,16 +1023,16 @@ class AllegroHandPosePlanner(VecTask):
         # reset shadow hand
         delta_max = self.shadow_hand_dof_upper_limits - self.shadow_hand_dof_default_pos
         delta_min = self.shadow_hand_dof_lower_limits - self.shadow_hand_dof_default_pos
-        rand_delta = delta_min + (delta_max - delta_min) * 0.5 * (rand_floats[:, 5:5+self.num_shadow_hand_dofs] + 1)
+        # rand_delta = delta_min + (delta_max - delta_min) * 0.5 * (rand_floats[:, 5:5+self.num_shadow_hand_dofs] + 1)
 
         # pos = self.shadow_hand_default_dof_pos + self.reset_dof_pos_noise * rand_delta
-        pos = self.poses[rand_indices, 7:].clone()
+        pos = pose_batch[:, 7:].clone()
         self.shadow_hand_dof_pos[env_ids, :] = pos
         self.shadow_hand_dof_vel[env_ids, :] = self.shadow_hand_dof_default_vel 
         # + \
         #     self.reset_dof_vel_noise * rand_floats[:, 5+self.num_shadow_hand_dofs:5+self.num_shadow_hand_dofs*2]
-        self.prev_targets[env_ids, :self.num_shadow_hand_dofs] = pos
-        self.cur_targets[env_ids, :self.num_shadow_hand_dofs] = pos
+        self.prev_targets[env_ids, :self.num_shadow_hand_dofs] = self.shadow_hand_dof_pos[env_ids, :].clone()
+        self.cur_targets[env_ids, :self.num_shadow_hand_dofs] = self.shadow_hand_dof_pos[env_ids, :].clone()
 
         hand_indices = self.hand_indices[env_ids].to(torch.int32)
         self.gym.set_dof_position_target_tensor_indexed(self.sim,
@@ -886,6 +1046,7 @@ class AllegroHandPosePlanner(VecTask):
         self.progress_buf[env_ids] = 0
         self.reset_buf[env_ids] = 0
         self.successes[env_ids] = 0
+
 
     def pre_physics_step(self, actions):
         # print("first env actions: ", actions[0])
@@ -986,6 +1147,8 @@ def compute_hand_reward(
     fall_penalty: float, max_consecutive_successes: int, av_factor: float, ignore_z_rot: bool
 ):
     # Distance from the hand to the object
+    # print("object_pos[0]: ", object_pos[0])
+    # print("target_pos[0]: ", target_pos[0])
     goal_dist = torch.norm(object_pos - target_pos, p=2, dim=-1)
     # print("goal_dist:", goal_dist[0])
 
@@ -1000,9 +1163,10 @@ def compute_hand_reward(
     joint_dist = torch.norm(hand_joints - target_joints, p=2, dim=-1)
     # joint_rew = joint_dist * -0.6
     # print("joint_dist [0]", joint_dist[0])
+    # print("goal dist [0] ", goal_dist[0])
 
-    dist_rew = goal_dist * dist_reward_scale * 1.2
-    rot_rew = 1.0/(torch.abs(rot_dist) + rot_eps) * rot_reward_scale * 0.4
+    dist_rew = goal_dist * dist_reward_scale * 1.0
+    rot_rew = 1.0/(torch.abs(rot_dist) + rot_eps) * rot_reward_scale * 0.5
 
     action_penalty = torch.sum(actions ** 2, dim=-1)
     # print("goal_dist [0] ", dist_rew[0])
@@ -1012,14 +1176,14 @@ def compute_hand_reward(
     reward = dist_rew + rot_rew + action_penalty * action_penalty_scale 
 
     # Find out which envs hit the goal and update successes count
-    joint_ok = (joint_dist <= success_tolerance*3)
+    # joint_ok = (joint_dist <= success_tolerance*3)
     dist_ok  = (goal_dist  <= success_tolerance * 0.15)
     rot_ok   = (torch.abs(rot_dist) <= success_tolerance*1)
 
     mask = dist_ok & rot_ok
     # joint_rew = torch.where(mask, joint_dist * -1.0, torch.zeros_like(joint_dist))
     # reward = reward + joint_rew
-    ok_sum = joint_ok.int() + dist_ok.int() + rot_ok.int()
+    ok_sum = dist_ok.int() + rot_ok.int()
     hit_goal = ok_sum >= 2
     goal_resets = torch.where(hit_goal, torch.ones_like(reset_goal_buf), reset_goal_buf)
     # goal_resets = torch.where(torch.abs(rot_dist) <= success_tolerance, torch.ones_like(reset_goal_buf), reset_goal_buf)
